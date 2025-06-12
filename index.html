@@ -2,14 +2,15 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ピックルボール作戦板 (Web版) - v2025.06.13-v7</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"> <title>ピックルボール作戦板 (Web版) - v2025.06.13-v8</title>
     <style>
         html, body {
             height: 100%;
             margin: 0;
             padding: 0;
             box-sizing: border-box;
+            -ms-touch-action: none; /* IE/Edgeでタッチイベントのデフォルト動作を無効化 */
+            touch-action: none; /* Chrome/Firefoxでタッチイベントのデフォルト動作を無効化 */
         }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -46,6 +47,9 @@
             overflow: hidden;
             flex-grow: 1;
             border-right: 1px solid #ddd;
+            /* タッチアクションのデフォルトを防ぐ */
+            -ms-touch-action: none;
+            touch-action: none;
         }
         canvas {
             position: absolute;
@@ -54,8 +58,7 @@
             width: 100%;
             height: 100%;
             display: block;
-            /* ズームとパンのために transform を使用 */
-            /* transform-origin はJavaScriptで設定 */
+            /* Canvas自体にCSS Transformは適用しない。JSでCtxにTransformを適用する */
         }
         #controls {
             padding: 10px 15px;
@@ -134,7 +137,8 @@
 </head>
 <body>
     <div id="app-container">
-        <div id="canvas-container" tabindex="0"> <canvas id="pickleballCanvas"></canvas>
+        <div id="canvas-container">
+            <canvas id="pickleballCanvas"></canvas>
         </div>
         <div id="controls">
             <button id="addPlayerBtn">選手を追加</button>
@@ -151,13 +155,13 @@
             </div>
             <button id="zoomOutBtn">ズームアウト (-)</button>
             <button id="zoomInBtn">ズームイン (+)</button>
-            <button id="resetAllBtn">すべてリセット</button>
+            <button id="resetZoomBtn">ズームリセット</button> <button id="resetAllBtn">すべてリセット</button>
         </div>
     </div>
 
     <script>
         // Version for debugging and tracking changes
-        const APP_VERSION = "2025.06.13-v7";
+        const APP_VERSION = "2025.06.13-v8";
         console.log(`Pickleball Tactics Board - Version: ${APP_VERSION}`);
 
         const canvas = document.getElementById('pickleballCanvas');
@@ -181,7 +185,7 @@
         let players = [];
         let currentPlayer = null;
         let currentBall = null;
-        let draggingBall = false;
+        let isDraggingPlayerOrBall = false; // 選手またはボールをドラッグ中かどうかのフラグ
 
         let lines = [];
         let drawLineMode = false;
@@ -190,7 +194,18 @@
         let currentLineColor = '#000000';
         let currentLineWidth = 3;
 
-        let currentZoomLevel = 1.0; // 現在のズームレベル
+        // ズームとパンの管理
+        let currentZoomLevel = 1.0;
+        let offsetX = 0; // パンのオフセットX
+        let offsetY = 0; // パンのオフセットY
+        let isPanning = false; // パン中かどうかのフラグ
+        let lastPanX = 0;
+        let lastPanY = 0;
+
+        // ピンチズーム用
+        let lastTouchDistance = null;
+        let lastTouchCenter = { x: 0, y: 0 };
+        let isPinching = false;
 
         let history = [];
         const MAX_HISTORY = 20;
@@ -205,6 +220,7 @@
         const resetAllBtn = document.getElementById('resetAllBtn');
         const zoomInBtn = document.getElementById('zoomInBtn');
         const zoomOutBtn = document.getElementById('zoomOutBtn');
+        const resetZoomBtn = document.getElementById('resetZoomBtn'); // ズームリセットボタン
 
         const lineWidthControl = document.getElementById('lineWidth');
         const lineColorControl = document.getElementById('lineColor');
@@ -215,7 +231,6 @@
             const container = document.getElementById('canvas-container');
             if (!container) {
                 console.error("Canvas container not found!");
-                // フォールバックとして固定サイズを設定
                 canvas.width = ORIGINAL_COURT_LENGTH_PX;
                 canvas.height = ORIGINAL_COURT_WIDTH_PX;
                 redrawAll();
@@ -230,7 +245,6 @@
             let newHeight = newWidth / courtAspectRatio;
 
             if (newWidth <= 0 || newHeight <= 0) {
-                 // コンテナが0になる場合のフォールバック
                  newWidth = ORIGINAL_COURT_LENGTH_PX;
                  newHeight = ORIGINAL_COURT_WIDTH_PX;
             }
@@ -242,18 +256,19 @@
             redrawAll();
         }
         
-        window.addEventListener('DOMContentLoaded', resizeCanvas);
+        window.addEventListener('DOMContentLoaded', () => {
+            resizeCanvas();
+            applyTransform(); // 初期描画時に変換を適用
+        });
         window.addEventListener('resize', resizeCanvas);
 
         // --- イベントリスナー設定 ---
         addPlayerBtn.addEventListener('click', () => {
-            // プレイヤーをコートの中央付近に追加 (長さ方向の半分、幅方向の半分から少しずらす)
             addPlayer(ORIGINAL_COURT_LENGTH_PX / 4, ORIGINAL_COURT_WIDTH_PX / 2); 
             saveHistory();
         });
 
         addBallBtn.addEventListener('click', () => {
-            // ボールをプレイヤーとは少しずらした位置に追加
             addBall(ORIGINAL_COURT_LENGTH_PX / 2 + 50, ORIGINAL_COURT_WIDTH_PX / 2 + 50);
             saveHistory();
         });
@@ -292,7 +307,13 @@
             currentLineWidth = 3;
             lineWidthControl.value = 3;
             lineColorControl.value = '#000000';
-            currentZoomLevel = 1.0; // ズームレベルもリセット
+            
+            // ズームとパンの状態をリセット
+            currentZoomLevel = 1.0;
+            offsetX = 0;
+            offsetY = 0;
+            applyTransform(); // 変換を適用
+            
             history = [];
             redrawAll();
         });
@@ -305,134 +326,166 @@
             currentLineColor = e.target.value;
         });
 
-        zoomInBtn.addEventListener('click', zoomIn);
-        zoomOutBtn.addEventListener('click', zoomOut);
+        zoomInBtn.addEventListener('click', () => zoom(ZOOM_STEP));
+        zoomOutBtn.addEventListener('click', () => zoom(-ZOOM_STEP));
+        resetZoomBtn.addEventListener('click', resetZoomAndPan); // 新しいボタンのイベントリスナー
 
         // マウスホイールでのズーム
         canvasContainer.addEventListener('wheel', (e) => {
             e.preventDefault(); // ページのスクロールを防ぐ
-            if (e.deltaY < 0) { // マウスホイール上方向 (奥)
-                zoomIn();
-            } else { // マウスホイール下方向 (手前)
-                zoomOut();
-            }
-        }, { passive: false }); // passive: false で preventDefault() を有効にする
+            const zoomAmount = e.deltaY * -0.001; // ホイールの動きをズーム量に変換
+            zoom(zoomAmount, e.clientX, e.clientY); // マウスカーソル位置をズーム中心に
+        }, { passive: false });
 
 
-        // --- ズーム機能 ---
-        function zoomIn() {
-            if (currentZoomLevel < MAX_ZOOM_LEVEL) {
-                currentZoomLevel = Math.min(MAX_ZOOM_LEVEL, currentZoomLevel + ZOOM_STEP);
-                applyZoom();
-            }
-        }
+        // --- ズームとパン機能 ---
+        function zoom(amount, zoomCenterX = canvas.width / 2, zoomCenterY = canvas.height / 2) {
+            const oldZoomLevel = currentZoomLevel;
+            currentZoomLevel = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, currentZoomLevel + amount));
 
-        function zoomOut() {
-            if (currentZoomLevel > MIN_ZOOM_LEVEL) {
-                currentZoomLevel = Math.max(MIN_ZOOM_LEVEL, currentZoomLevel - ZOOM_STEP);
-                applyZoom();
-            }
-        }
+            if (currentZoomLevel === oldZoomLevel) return; // ズームレベルが変わらなければ処理しない
 
-        function applyZoom() {
-            // CSS Transform を使ってキャンバス全体をズーム
-            // transform-origin を '0 0' に設定して、左上を基準にズーム
-            // 中央ズームが必要な場合は、パン機能と組み合わせて複雑になる
-            canvas.style.transformOrigin = 'center center'; // 中心をズームの基準に設定
-            canvas.style.transform = `scale(${currentZoomLevel})`;
+            // ズーム中心を基準としたパンの調整
+            // (x - offsetX) * newZoom = (x_old - offsetX_old) * oldZoom
+            // x_old: 元の座標系でのマウス位置
+            // x: 現在の座標系でのマウス位置
+            // 新しいオフセット = (old_x - old_offset_x) * old_zoom / new_zoom + old_offset_x - mouse_delta
+            // これだと少し複雑なので、シンプルにズーム中心が画面中央の場合は以下の式で調整
             
-            // 描画自体は論理座標で行い、最終的にこのCSSズームで拡大・縮小される
-            // ただし、当たり判定などは実際の描画サイズに合わせて調整する必要がある
-            redrawAll(); // ズームレベルが変わったら再描画
-            console.log("Current Zoom Level:", currentZoomLevel);
+            // ズーム中心のキャンバス座標 (スケール/パン前)
+            const canvasZoomCenterX = (zoomCenterX - offsetX) / oldZoomLevel;
+            const canvasZoomCenterY = (zoomCenterY - offsetY) / oldZoomLevel;
+
+            // 新しいオフセットを計算
+            offsetX = zoomCenterX - canvasZoomCenterX * currentZoomLevel;
+            offsetY = zoomCenterY - canvasZoomCenterY * currentZoomLevel;
+
+            applyTransform();
+            console.log("Current Zoom Level:", currentZoomLevel, "OffsetX:", offsetX, "OffsetY:", offsetY);
+        }
+
+        function resetZoomAndPan() {
+            currentZoomLevel = 1.0;
+            offsetX = 0;
+            offsetY = 0;
+            applyTransform();
+        }
+
+        function applyTransform() {
+            // CSS transformではなく、Canvas contextのtransformを直接操作
+            redrawAll(); // 変換を適用するために再描画を呼び出す
         }
 
         // --- マウス/タッチイベント処理 ---
-        function handleInteractionStart(clientX, clientY) {
+        function getTransformedCoords(clientX, clientY) {
             const rect = canvas.getBoundingClientRect();
             // 現在のキャンバスの表示サイズを考慮して入力座標を計算
-            // CSS Transformでズームされているため、getBoundingClientRect()から取得されるサイズはズーム後のサイズ
-            // そのため、inputX/Yを元のキャンバスの論理ピクセルに戻す必要がある
-            const inputX = (clientX - rect.left) / currentZoomLevel; 
-            const inputY = (clientY - rect.top) / currentZoomLevel; 
+            // CSS Transformでズームされていた前回とは異なり、
+            // 今はctx.scale/translateが適用されているので、逆変換が必要
+            let x = clientX - rect.left;
+            let y = clientY - rect.top;
 
-            // 画面座標(inputX, inputY)を、元のコート座標系(ORIGINAL_COURT_LENGTH_PX, ORIGINAL_COURT_WIDTH_PX)に変換するためのスケール
-            // ここでの canvas.width/height は論理的なキャンバスサイズ（ズームされていない状態）
+            // パンとズームの逆変換
+            x = (x - offsetX) / currentZoomLevel;
+            y = (y - offsetY) / currentZoomLevel;
+
+            // 元のコート座標系に変換するためのスケール
             const scaleX_to_original = ORIGINAL_COURT_LENGTH_PX / canvas.width;
             const scaleY_to_original = ORIGINAL_COURT_WIDTH_PX / canvas.height;
 
-            const scaledInputX = inputX * scaleX_to_original; // 元のコート座標系でのX座標
-            const scaledInputY = inputY * scaleY_to_original; // 元のコート座標系でのY座標
+            const transformedX = x * scaleX_to_original; // 元のコート座標系でのX座標
+            const transformedY = y * scaleY_to_original; // 元のコート座標系でのY座標
 
-            // 元のコート座標系の値を画面座標系に変換するためのスケール（当たり判定用）
-            // この scaleX_for_rendering は、論理的なキャンバスサイズにおける描画スケール
+            return { x: transformedX, y: transformedY, inputX: x, inputY: y }; // inputX, inputYは当たり判定用
+        }
+
+        function handleInteractionStart(e) {
+            e.preventDefault(); // デフォルトのブラウザ操作（スクロール、ピンチズームなど）を抑制
+
+            // ピンチジェスチャーの開始判定
+            if (e.touches && e.touches.length === 2) {
+                isPinching = true;
+                lastTouchDistance = Math.sqrt(
+                    Math.pow(e.touches[0].clientX - e.touches[1].clientX, 2) +
+                    Math.pow(e.touches[0].clientY - e.touches[1].clientY, 2)
+                );
+                lastTouchCenter = {
+                    x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+                    y: (e.touches[0].clientY + e.touches[1].clientY) / 2
+                };
+                // ピンチ開始時は他の操作をリセット
+                currentPlayer = null;
+                isDraggingPlayerOrBall = false;
+                isPanning = false;
+                drawLineMode = false; // ピンチ中は線描画モードをOFFにするか検討
+                toggleLineModeBtn.textContent = '線描画モード (OFF)';
+                canvas.style.cursor = 'default';
+                return;
+            }
+
+            // マウスまたはシングルタッチでの操作開始
+            const clientX = e.clientX || e.touches[0].clientX;
+            const clientY = e.clientY || e.touches[0].clientY;
+
+            const { x: scaledInputX, y: scaledInputY, inputX, inputY } = getTransformedCoords(clientX, clientY);
+            
+            // 当たり判定に必要なスケール
             const scaleX_for_rendering = canvas.width / ORIGINAL_COURT_LENGTH_PX;
             const scaleY_for_rendering = canvas.height / ORIGINAL_COURT_WIDTH_PX;
-            // 当たり判定の半径は、ズームレベルを考慮して調整する必要がある
             const radiusScaleFactor = Math.min(scaleX_for_rendering, scaleY_for_rendering);
 
-
             if (drawLineMode) {
-                // 線描画モードの場合
                 lineStart = { x: scaledInputX, y: scaledInputY };
                 currentDrawingLine = { startX: scaledInputX, startY: scaledInputY, endX: scaledInputX, endY: scaledInputY, color: currentLineColor, width: currentLineWidth };
+                isDraggingPlayerOrBall = false; // 線描画中は他のドラッグはなし
             } else {
-                // 通常モード（選手、ボールの操作、線の削除）
-
-                // まずボールのドラッグ判定 (ボールが存在する場合)
+                // まずボールのドラッグ判定
                 if (currentBall) {
-                    // ボールの描画座標 (論理ピクセル)
-                    const ballRenderX = currentBall.x * scaleX_for_rendering; 
-                    const ballRenderY = currentBall.y * scaleY_for_rendering; 
-                    // ボールの半径 (論理ピクセル)
-                    const ballRenderRadius = currentBall.radius * radiusScaleFactor; 
+                    const ballRenderX = currentBall.x * scaleX_for_rendering;
+                    const ballRenderY = currentBall.y * scaleY_for_rendering;
+                    const ballRenderRadius = currentBall.radius * radiusScaleFactor;
                     
-                    // 当たり判定は論理ピクセルで計算
                     const distToBall = Math.sqrt(Math.pow(inputX - ballRenderX, 2) + Math.pow(inputY - ballRenderY, 2));
                     if (distToBall < ballRenderRadius + HIT_AREA_PADDING) {
+                        isDraggingPlayerOrBall = true;
                         draggingBall = true;
                         currentPlayer = null;
-                        return; // ボールが選択されたら、プレイヤーや線のチェックはしない
+                        return;
                     }
                 }
 
-                // ボールがドラッグされなかったら、プレイヤーのドラッグ判定
+                // プレイヤーのドラッグ判定
                 for (let i = players.length - 1; i >= 0; i--) {
                     const p = players[i];
-                    // プレイヤーの描画座標 (論理ピクセル)
-                    const playerRenderX = p.x * scaleX_for_rendering; 
-                    const playerRenderY = p.y * scaleY_for_rendering; 
-                    // プレイヤーの半径 (論理ピクセル)
-                    const playerRenderRadius = p.radius * radiusScaleFactor; 
+                    const playerRenderX = p.x * scaleX_for_rendering;
+                    const playerRenderY = p.y * scaleY_for_rendering;
+                    const playerRenderRadius = p.radius * radiusScaleFactor;
 
-                    // 当たり判定は論理ピクセルで計算
                     const dist = Math.sqrt(Math.pow(inputX - playerRenderX, 2) + Math.pow(inputY - playerRenderY, 2));
                     if (dist < playerRenderRadius + HIT_AREA_PADDING) {
+                        isDraggingPlayerOrBall = true;
                         currentPlayer = p;
                         draggingBall = false;
-                        return; // プレイヤーが選択されたら、線のチェックはしない
+                        return;
                     }
                 }
 
                 // 選手もボールも選択されなかったら、線の削除判定
                 for (let i = lines.length - 1; i >= 0; i--) {
                     const l = lines[i];
-                    // 線分の描画位置を論理ピクセルに変換
                     const lineRenderStartX = l.startX * scaleX_for_rendering;
                     const lineRenderStartY = l.startY * scaleY_for_rendering;
                     const lineRenderEndX = l.endX * scaleX_for_rendering;
                     const lineRenderEndY = l.endY * scaleY_for_rendering;
-                    // 線の太さも論理ピクセルに合わせる
-                    const lineRenderWidth = l.width * Math.min(scaleX_for_rendering, scaleY_for_rendering); 
+                    const lineRenderWidth = l.width * Math.min(scaleX_for_rendering, scaleY_for_rendering);
 
-                    // 点と線分の距離を計算 (論理ピクセルで)
                     const dx = lineRenderEndX - lineRenderStartX;
                     const dy = lineRenderEndY - lineRenderStartY;
                     const lenSq = dx * dx + dy * dy;
                     let t = 0;
-                    if (lenSq !== 0) { // 長さが0でない場合のみ計算
+                    if (lenSq !== 0) {
                         t = ((inputX - lineRenderStartX) * dx + (inputY - lineRenderStartY) * dy) / lenSq;
-                        t = Math.max(0, Math.min(1, t)); // 線分内に制限
+                        t = Math.max(0, Math.min(1, t));
                     }
                     
                     const closestX = lineRenderStartX + t * dx;
@@ -440,72 +493,124 @@
 
                     const distToLine = Math.sqrt(Math.pow(inputX - closestX, 2) + Math.pow(inputY - closestY, 2));
                     
-                    // 線の太さ + パディングで判定 (論理ピクセルで)
                     if (distToLine < (lineRenderWidth / 2) + HIT_AREA_PADDING) {
-                        lines.splice(i, 1); // その線を削除
+                        lines.splice(i, 1);
                         redrawAll();
                         saveHistory();
-                        return; // 1つの線だけ削除
+                        return;
                     }
                 }
+
+                // 何も選択されなかったらパンを開始
+                isPanning = true;
+                lastPanX = clientX;
+                lastPanY = clientY;
             }
         }
 
-        function handleInteractionMove(clientX, clientY) {
-            const rect = canvas.getBoundingClientRect();
-            // ズームを考慮して論理ピクセルに戻す
-            const inputX = (clientX - rect.left) / currentZoomLevel;
-            const inputY = (clientY - rect.top) / currentZoomLevel;
+        function handleInteractionMove(e) {
+            e.preventDefault();
 
-            // 画面座標を元のコート座標系に変換するためのスケール (canvas.width/heightは論理サイズ)
-            const scaleX_to_original = ORIGINAL_COURT_LENGTH_PX / canvas.width;
-            const scaleY_to_original = ORIGINAL_COURT_WIDTH_PX / canvas.height;
+            // ピンチジェスチャー中
+            if (isPinching && e.touches && e.touches.length === 2) {
+                const currentTouchDistance = Math.sqrt(
+                    Math.pow(e.touches[0].clientX - e.touches[1].clientX, 2) +
+                    Math.pow(e.touches[0].clientY - e.touches[1].clientY, 2)
+                );
+                const currentTouchCenter = {
+                    x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+                    y: (e.touches[0].clientY + e.touches[1].clientY) / 2
+                };
 
-            const scaledInputX = inputX * scaleX_to_original;
-            const scaledInputY = inputY * scaleY_to_original;
+                // ズーム
+                if (lastTouchDistance !== null) {
+                    const scaleFactor = currentTouchDistance / lastTouchDistance;
+                    const newZoomLevel = currentZoomLevel * scaleFactor;
+                    
+                    // ズーム範囲を制限
+                    const clampedZoomLevel = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, newZoomLevel));
+
+                    // ズーム中心を考慮してパンを調整
+                    offsetX += currentTouchCenter.x - lastTouchCenter.x - (currentTouchCenter.x - offsetX) * (clampedZoomLevel / currentZoomLevel - 1);
+                    offsetY += currentTouchCenter.y - lastTouchCenter.y - (currentTouchCenter.y - offsetY) * (clampedZoomLevel / currentZoomLevel - 1);
+
+                    currentZoomLevel = clampedZoomLevel;
+                }
+                lastTouchDistance = currentTouchDistance;
+                lastTouchCenter = currentTouchCenter;
+
+                applyTransform();
+                return;
+            }
+
+            // 選手/ボールのドラッグ、線描画、パン
+            const clientX = e.clientX || e.touches[0].clientX;
+            const clientY = e.clientY || e.touches[0].clientY;
+
+            const { x: scaledInputX, y: scaledInputY } = getTransformedCoords(clientX, clientY);
 
             if (drawLineMode && lineStart) {
                 currentDrawingLine.endX = scaledInputX;
                 currentDrawingLine.endY = scaledInputY;
                 redrawAll();
-            } else if (draggingBall && currentBall) {
-                currentBall.x = scaledInputX;
-                currentBall.y = scaledInputY;
+            } else if (isDraggingPlayerOrBall) { // 選手かボールをドラッグ中
+                if (draggingBall && currentBall) {
+                    currentBall.x = scaledInputX;
+                    currentBall.y = scaledInputY;
+                } else if (currentPlayer) {
+                    currentPlayer.x = scaledInputX;
+                    currentPlayer.y = scaledInputY;
+                }
                 redrawAll();
-            } else if (currentPlayer) {
-                currentPlayer.x = scaledInputX;
-                currentPlayer.y = scaledInputY;
-                redrawAll();
+            } else if (isPanning) { // パン中
+                const dx = clientX - lastPanX;
+                const dy = clientY - lastPanY;
+                offsetX += dx;
+                offsetY += dy;
+                lastPanX = clientX;
+                lastPanY = clientY;
+                applyTransform();
             }
         }
 
-        function handleInteractionEnd() {
+        function handleInteractionEnd(e) {
+            e.preventDefault();
+
+            // ピンチジェスチャーの終了
+            if (isPinching) {
+                isPinching = false;
+                lastTouchDistance = null;
+                // ピンチ終了時にも履歴を保存するならここに追加
+                // saveHistory(); 
+                return;
+            }
+
+            // 線描画の確定
             if (drawLineMode && lineStart && currentDrawingLine) {
                 lines.push({ ...currentDrawingLine });
                 lineStart = null;
                 currentDrawingLine = null;
                 saveHistory();
             }
+            
+            // ドラッグ/パンの終了
             currentPlayer = null;
             draggingBall = false;
+            isDraggingPlayerOrBall = false;
+            isPanning = false;
             redrawAll();
         }
 
-        canvas.addEventListener('mousedown', (e) => { handleInteractionStart(e.clientX, e.clientY); });
-        canvas.addEventListener('mousemove', (e) => { handleInteractionMove(e.clientX, e.clientY); });
-        canvas.addEventListener('mouseup', () => { handleInteractionEnd(); });
+        // イベントリスナーの追加
+        canvas.addEventListener('mousedown', handleInteractionStart);
+        canvas.addEventListener('mousemove', handleInteractionMove);
+        canvas.addEventListener('mouseup', handleInteractionEnd);
+        canvas.addEventListener('mouseleave', handleInteractionEnd); // キャンバス外に出た場合も終了
 
-        canvas.addEventListener('touchstart', (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            handleInteractionStart(touch.clientX, touch.clientY);
-        });
-        canvas.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            const touch = e.touches[0];
-            handleInteractionMove(touch.clientX, touch.clientY);
-        });
-        canvas.addEventListener('touchend', () => { handleInteractionEnd(); });
+        canvas.addEventListener('touchstart', handleInteractionStart, { passive: false });
+        canvas.addEventListener('touchmove', handleInteractionMove, { passive: false });
+        canvas.addEventListener('touchend', handleInteractionEnd);
+        canvas.addEventListener('touchcancel', handleInteractionEnd); // 電話などで中断された場合
 
 
         // --- プレイヤー/ボール追加関数 (x, y は元のコート座標系) ---
@@ -523,25 +628,27 @@
         function redrawAll() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+            // Canvasコンテキストを保存
+            ctx.save();
+            
+            // パンを適用
+            ctx.translate(offsetX, offsetY);
+            // ズームを適用
+            ctx.scale(currentZoomLevel, currentZoomLevel);
+
             // 描画用のスケール（元の座標系から現在のキャンバスサイズへの変換）
+            // このスケールはズーム・パンが適用される前の論理的なキャンバスサイズに基づく
             const scaleX = canvas.width / ORIGINAL_COURT_LENGTH_PX; // 横方向のスケール (長さ方向)
             const scaleY = canvas.height / ORIGINAL_COURT_WIDTH_PX;    // 縦方向のスケール (幅方向)
 
-            // Canvas描画コンテキスト自体をズームする (これはCSS transformと両立できないため、CSS transformを使用)
-            // ctx.save();
-            // ctx.scale(currentZoomLevel, currentZoomLevel);
-
             // --- ピックルボールコートの描画 ---
-            // 外枠 (ベースラインとサイドライン)
             drawSimpleRect(0, 0, ORIGINAL_COURT_LENGTH_PX, ORIGINAL_COURT_WIDTH_PX, 'white', 3, scaleX, scaleY);
 
-            // ネット (コートの長さ中央)
-            const netX = ORIGINAL_COURT_LENGTH_PX / 2; // X方向の半分
+            const netX = ORIGINAL_COURT_LENGTH_PX / 2;
             drawSimpleLine(netX, 0, netX, ORIGINAL_COURT_WIDTH_PX, 'white', 3, scaleX, scaleY);
 
-            // キッチンライン (ネットから7フィート)
-            const feetToOriginalPxLength = ORIGINAL_COURT_LENGTH_PX / 44; // 長さ方向の1フィートあたりのピクセル数 (44フィートがORIGINAL_COURT_LENGTH_PXに相当)
-            const kitchenLineOffsetPx = 7 * feetToOriginalPxLength; // キッチンラインまでのピクセルオフセット
+            const feetToOriginalPxLength = ORIGINAL_COURT_LENGTH_PX / 44;
+            const kitchenLineOffsetPx = 7 * feetToOriginalPxLength;
 
             const kitchenLineX_leftHalf = netX - kitchenLineOffsetPx;
             const kitchenLineX_rightHalf = netX + kitchenLineOffsetPx;
@@ -549,34 +656,30 @@
             drawSimpleLine(kitchenLineX_leftHalf, 0, kitchenLineX_leftHalf, ORIGINAL_COURT_WIDTH_PX, 'white', 3, scaleX, scaleY);
             drawSimpleLine(kitchenLineX_rightHalf, 0, kitchenLineX_rightHalf, ORIGINAL_COURT_WIDTH_PX, 'white', 3, scaleX, scaleY);
 
-            // センターサービスライン (キッチンラインからベースラインまで、両サイド)
-            const centerLineY = ORIGINAL_COURT_WIDTH_PX / 2; // Y方向の半分
-
-            drawSimpleLine(0, centerLineY, kitchenLineX_leftHalf, centerLineY, 'white', 3, scaleX, scaleY); // 左半分サービスゾーンのセンターライン
-            drawSimpleLine(kitchenLineX_rightHalf, centerLineY, ORIGINAL_COURT_LENGTH_PX, centerLineY, 'white', 3, scaleX, scaleY); // 右半分サービスゾーンのセンターライン
+            const centerLineY = ORIGINAL_COURT_WIDTH_PX / 2;
+            drawSimpleLine(0, centerLineY, kitchenLineX_leftHalf, centerLineY, 'white', 3, scaleX, scaleY);
+            drawSimpleLine(kitchenLineX_rightHalf, centerLineY, ORIGINAL_COURT_LENGTH_PX, centerLineY, 'white', 3, scaleX, scaleY);
 
 
             // --- プレイヤーの描画 ---
             players.forEach(p => {
                 ctx.beginPath();
-                // 描画座標と半径をスケールで変換
                 ctx.arc(p.x * scaleX, p.y * scaleY, p.radius * Math.min(scaleX, scaleY), 0, Math.PI * 2);
                 ctx.fillStyle = p.color;
                 ctx.fill();
                 ctx.strokeStyle = 'black';
-                ctx.lineWidth = 1;
+                ctx.lineWidth = 1 / currentZoomLevel; // ズームレベルに応じて線の太さを調整 (相対的な太さを維持)
                 ctx.stroke();
             });
 
             // --- ボールの描画 (存在する場合) ---
             if (currentBall) {
                 ctx.beginPath();
-                // 描画座標と半径をスケールで変換
                 ctx.arc(currentBall.x * scaleX, currentBall.y * scaleY, currentBall.radius * Math.min(scaleX, scaleY), 0, Math.PI * 2);
                 ctx.fillStyle = currentBall.color;
                 ctx.fill();
                 ctx.strokeStyle = 'black';
-                ctx.lineWidth = 1;
+                ctx.lineWidth = 1 / currentZoomLevel; // 線の太さ調整
                 ctx.stroke();
             }
 
@@ -590,22 +693,21 @@
                 drawArrowLine(currentDrawingLine.startX, currentDrawingLine.startY, currentDrawingLine.endX, currentDrawingLine.endY, currentDrawingLine.color, currentDrawingLine.width, scaleX, scaleY);
             }
             
-            // ctx.restore(); // ctx.scale を使用した場合
+            // Canvasコンテキストを元に戻す
+            ctx.restore();
         }
 
         // --- 図形描画ヘルパー関数 (コートライン用、矢印なし) ---
         function drawSimpleRect(x, y, width, height, color, lineWidth, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = lineWidth;
-            // 座標とサイズをスケールで変換
+            ctx.lineWidth = lineWidth / currentZoomLevel; // ズームレベルに応じて線の太さを調整
             ctx.strokeRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
         }
 
         function drawSimpleLine(x1, y1, x2, y2, color, width, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = width;
+            ctx.lineWidth = width / currentZoomLevel; // ズームレベルに応じて線の太さを調整
             ctx.beginPath();
-            // 座標をスケールで変換
             ctx.moveTo(x1 * scaleX, y1 * scaleY);
             ctx.lineTo(x2 * scaleX, y2 * scaleY); 
             ctx.stroke();
@@ -614,9 +716,9 @@
         // --- 矢印付きの線を描画するヘルパー関数 (ユーザー描画線用) ---
         function drawArrowLine(x1, y1, x2, y2, color, width, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = width;
+            ctx.lineWidth = width / currentZoomLevel; // ズームレベルに応じて線の太さを調整
             ctx.beginPath();
-            // 座標をスケールで変換
+            
             const sx1 = x1 * scaleX;
             const sy1 = y1 * scaleY;
             const sx2 = x2 * scaleX;
@@ -627,17 +729,20 @@
             ctx.stroke();
 
             // 矢印の描画
+            // 矢印のサイズはズームレベルの影響を受けないように、描画時に調整
+            const effectiveArrowheadSize = ARROWHEAD_SIZE / currentZoomLevel;
+
             const lineLength = Math.sqrt(Math.pow(sx2 - sx1, 2) + Math.pow(sy2 - sy1, 2));
 
             // 線が十分に長い場合にのみ矢印を描画
-            if (lineLength > ARROWHEAD_SIZE * 2) { 
+            if (lineLength > effectiveArrowheadSize * 2) { 
                 const angle = Math.atan2(sy2 - sy1, sx2 - sx1);
 
                 ctx.beginPath();
                 ctx.moveTo(sx2, sy2);
-                ctx.lineTo(sx2 - ARROWHEAD_SIZE * Math.cos(angle - ARROWHEAD_ANGLE), sy2 - ARROWHEAD_SIZE * Math.sin(angle - ARROWHEAD_ANGLE));
+                ctx.lineTo(sx2 - effectiveArrowheadSize * Math.cos(angle - ARROWHEAD_ANGLE), sy2 - effectiveArrowheadSize * Math.sin(angle - ARROWHEAD_ANGLE));
                 ctx.moveTo(sx2, sy2);
-                ctx.lineTo(sx2 - ARROWHEAD_SIZE * Math.cos(angle + ARROWHEAD_ANGLE), sy2 - ARROWHEAD_SIZE * Math.sin(angle + ARROWHEAD_ANGLE));
+                ctx.lineTo(sx2 - effectiveArrowheadSize * Math.cos(angle + ARROWHEAD_ANGLE), sy2 - effectiveArrowheadSize * Math.sin(angle + ARROWHEAD_ANGLE));
                 ctx.stroke();
             }
         }
@@ -650,7 +755,10 @@
             history.push({
                 players: JSON.parse(JSON.stringify(players)),
                 lines: JSON.parse(JSON.stringify(lines)),
-                currentBall: currentBall ? JSON.parse(JSON.stringify(currentBall)) : null
+                currentBall: currentBall ? JSON.parse(JSON.stringify(currentBall)) : null,
+                zoomLevel: currentZoomLevel, // ズームレベルも履歴に保存
+                offsetX: offsetX,
+                offsetY: offsetY
             });
             updateUndoButton();
         }
@@ -661,6 +769,10 @@
                 players = JSON.parse(JSON.stringify(prevState.players));
                 lines = JSON.parse(JSON.stringify(prevState.lines));
                 currentBall = prevState.currentBall ? JSON.parse(JSON.stringify(prevState.currentBall)) : null;
+                currentZoomLevel = prevState.zoomLevel !== undefined ? prevState.zoomLevel : 1.0;
+                offsetX = prevState.offsetX !== undefined ? prevState.offsetX : 0;
+                offsetY = prevState.offsetY !== undefined ? prevState.offsetY : 0;
+                applyTransform(); // 変換を適用
                 redrawAll();
                 updateUndoButton();
             }
@@ -673,9 +785,6 @@
         // 初期状態を履歴に保存し、アンドゥボタンを更新
         saveHistory();
         updateUndoButton();
-
-        // ズーム機能の初期適用 (念のため)
-        applyZoom();
 
     </script>
 </body>
