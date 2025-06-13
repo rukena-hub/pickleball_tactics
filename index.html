@@ -2,15 +2,18 @@
 <html lang="ja">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no"> <title>ピックルボール作戦板 (Web版) - v2025.06.13-v8</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>ピックルボール作戦板 (Web版) - v2025.06.13-v11</title>
     <style>
         html, body {
             height: 100%;
             margin: 0;
             padding: 0;
             box-sizing: border-box;
+            /* touch-action: none; をbodyレベルで設定すると、スクロールなどもできなくなるので、canvas要素に限定 */
             -ms-touch-action: none; /* IE/Edgeでタッチイベントのデフォルト動作を無効化 */
             touch-action: none; /* Chrome/Firefoxでタッチイベントのデフォルト動作を無効化 */
+            overflow: hidden; /* bodyレベルでスクロールを防ぐ */
         }
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -18,47 +21,37 @@
             justify-content: center;
             align-items: center;
             background-color: #f0f0f0;
-            overflow: hidden;
-            padding: 5px;
+            padding: 5px; /* 全体の余白 */
         }
         #app-container {
             display: flex;
+            flex-direction: column; /* 縦方向に要素を並べる */
             border: 1px solid #ccc;
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
             background-color: white;
             border-radius: 8px;
-            overflow: hidden;
-            flex-direction: column;
+            overflow: hidden; /* コンテナ内でコンテンツがはみ出さないように */
             width: 100%;
             height: 100%;
-            max-width: 1200px;
-            max-height: 98vh;
+            max-width: 1200px; /* PCでの最大幅 */
+            max-height: calc(100vh - 10px); /* 100vhからbodyのpaddingを引く */
             box-sizing: border-box;
         }
         #canvas-container {
             position: relative;
             background-color: #5cb85c; /* ピックルボールコートの芝生の色 */
-            
-            width: 100%;
-            /* 実際のコートの長さ44フィート:幅20フィート = 44:20 = 2.2:1
-               幅に対する高さの比率を 1/2.2 = 0.4545... に設定 */
-            padding-bottom: calc(100% / 2.2); /* 縦横比を 44:20 に維持 */
-            height: 0;
-            overflow: hidden;
-            flex-grow: 1;
-            border-right: 1px solid #ddd;
-            /* タッチアクションのデフォルトを防ぐ */
-            -ms-touch-action: none;
-            touch-action: none;
+            flex-grow: 1; /* 残りのスペースをすべて占める */
+            display: flex; /* canvasを中央揃えにするため */
+            justify-content: center;
+            align-items: center;
+            overflow: hidden; /* canvasがはみ出してもスクロールさせない */
         }
         canvas {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
             display: block;
-            /* Canvas自体にCSS Transformは適用しない。JSでCtxにTransformを適用する */
+            /* canvasのサイズはJSで設定するため、ここでは初期値を設定しない */
+            /* touch-action: none; はcanvasでしかズーム・パンをさせない場合に重要 */
+            -ms-touch-action: none;
+            touch-action: none;
         }
         #controls {
             padding: 10px 15px;
@@ -69,7 +62,7 @@
             gap: 8px;
             justify-content: center;
             align-items: center;
-            flex-shrink: 0;
+            flex-shrink: 0; /* コントロールが縮まないように */
         }
         button, select, input[type="range"] {
             padding: 8px 12px;
@@ -153,15 +146,15 @@
                 <label for="lineColor">線の色:</label>
                 <input type="color" id="lineColor" value="#000000">
             </div>
-            <button id="zoomOutBtn">ズームアウト (-)</button>
-            <button id="zoomInBtn">ズームイン (+)</button>
-            <button id="resetZoomBtn">ズームリセット</button> <button id="resetAllBtn">すべてリセット</button>
+            <button id="resetZoomBtn">ズームリセット</button>
+            <button id="togglePanModeBtn">パンモード</button>
+            <button id="resetAllBtn">すべてリセット</button>
         </div>
     </div>
 
     <script>
         // Version for debugging and tracking changes
-        const APP_VERSION = "2025.06.13-v8";
+        const APP_VERSION = "2025.06.13-v11";
         console.log(`Pickleball Tactics Board - Version: ${APP_VERSION}`);
 
         const canvas = document.getElementById('pickleballCanvas');
@@ -172,6 +165,7 @@
         // 横方向をコートの長さ(44ft)、縦方向をコートの幅(20ft)として扱う
         const ORIGINAL_COURT_LENGTH_PX = 1100; // 横方向 (44フィートに相当)
         const ORIGINAL_COURT_WIDTH_PX = 500;    // 縦方向 (20フィートに相当)
+        const COURT_ASPECT_RATIO = ORIGINAL_COURT_LENGTH_PX / ORIGINAL_COURT_WIDTH_PX; // 2.2
 
         const HIT_AREA_PADDING = 25; // プレイヤーやボールの反応範囲に加えるパディング (px)
         const ARROWHEAD_SIZE = 10; // 矢印のサイズ (px)
@@ -186,6 +180,7 @@
         let currentPlayer = null;
         let currentBall = null;
         let isDraggingPlayerOrBall = false; // 選手またはボールをドラッグ中かどうかのフラグ
+        let draggingBall = false; // ボールをドラッグ中かどうかのフラグ
 
         let lines = [];
         let drawLineMode = false;
@@ -198,11 +193,12 @@
         let currentZoomLevel = 1.0;
         let offsetX = 0; // パンのオフセットX
         let offsetY = 0; // パンのオフセットY
-        let isPanning = false; // パン中かどうかのフラグ
+        let isPanning = false; // パン中かどうかのフラグ (シングルタッチ/マウストラック用)
+        let panMode = false; // パンモードON/OFF切り替え用フラグ
         let lastPanX = 0;
         let lastPanY = 0;
 
-        // ピンチズーム用
+        // ピンチズーム用 (2本指タッチ)
         let lastTouchDistance = null;
         let lastTouchCenter = { x: 0, y: 0 };
         let isPinching = false;
@@ -218,19 +214,19 @@
         const clearLinesBtn = document.getElementById('clearLinesBtn');
         const undoBtn = document.getElementById('undoBtn');
         const resetAllBtn = document.getElementById('resetAllBtn');
-        const zoomInBtn = document.getElementById('zoomInBtn');
-        const zoomOutBtn = document.getElementById('zoomOutBtn');
-        const resetZoomBtn = document.getElementById('resetZoomBtn'); // ズームリセットボタン
+        const resetZoomBtn = document.getElementById('resetZoomBtn');
+        const togglePanModeBtn = document.getElementById('togglePanModeBtn');
 
         const lineWidthControl = document.getElementById('lineWidth');
         const lineColorControl = document.getElementById('lineColor');
-        const canvasContainer = document.getElementById('canvas-container'); // マウスホイールイベント用
+        const canvasContainer = document.getElementById('canvas-container');
 
         // --- キャンバスのリサイズと初期描画 ---
         function resizeCanvas() {
             const container = document.getElementById('canvas-container');
             if (!container) {
                 console.error("Canvas container not found!");
+                // Fallback for cases where container is not found, though it should be.
                 canvas.width = ORIGINAL_COURT_LENGTH_PX;
                 canvas.height = ORIGINAL_COURT_WIDTH_PX;
                 redrawAll();
@@ -238,29 +234,34 @@
             }
 
             const containerWidth = container.clientWidth;
-            // コートの縦横比を 44フィート:20フィート (2.2:1) に設定
-            const courtAspectRatio = ORIGINAL_COURT_LENGTH_PX / ORIGINAL_COURT_WIDTH_PX;
+            const containerHeight = container.clientHeight;
 
-            let newWidth = containerWidth;
-            let newHeight = newWidth / courtAspectRatio;
+            let newCanvasWidth, newCanvasHeight;
 
-            if (newWidth <= 0 || newHeight <= 0) {
-                 newWidth = ORIGINAL_COURT_LENGTH_PX;
-                 newHeight = ORIGINAL_COURT_WIDTH_PX;
+            // コンテナの縦横比とコートの縦横比を比較
+            if (containerWidth / containerHeight > COURT_ASPECT_RATIO) {
+                // コンテナがコートより横長の場合、高さを基準に幅を調整
+                newCanvasHeight = containerHeight;
+                newCanvasWidth = containerHeight * COURT_ASPECT_RATIO;
+            } else {
+                // コンテナがコートより縦長または同程度の場合、幅を基準に高さを調整
+                newCanvasWidth = containerWidth;
+                newCanvasHeight = containerWidth / COURT_ASPECT_RATIO;
             }
 
-            canvas.width = newWidth;
-            canvas.height = newHeight;
+            canvas.width = newCanvasWidth;
+            canvas.height = newCanvasHeight;
 
             console.log('Canvas resized to:', canvas.width, 'x', canvas.height);
-            redrawAll();
+            // ズームとパンの変換を適用して再描画
+            applyTransform(); 
         }
         
         window.addEventListener('DOMContentLoaded', () => {
             resizeCanvas();
             applyTransform(); // 初期描画時に変換を適用
         });
-        window.addEventListener('resize', resizeCanvas);
+        window.addEventListener('resize', resizeCanvas); // ウィンドウのリサイズ時に再調整
 
         // --- イベントリスナー設定 ---
         addPlayerBtn.addEventListener('click', () => {
@@ -284,6 +285,19 @@
             drawLineMode = !drawLineMode;
             toggleLineModeBtn.textContent = drawLineMode ? '線描画モード (ON)' : '線描画モード (OFF)';
             canvas.style.cursor = drawLineMode ? 'crosshair' : 'default';
+            // 線描画モードON/OFFでパンモードもOFFにする
+            panMode = false;
+            togglePanModeBtn.textContent = 'パンモード (OFF)';
+            canvas.style.cursor = 'default';
+        });
+
+        togglePanModeBtn.addEventListener('click', () => {
+            panMode = !panMode;
+            togglePanModeBtn.textContent = panMode ? 'パンモード (ON)' : 'パンモード (OFF)';
+            // パンモードON/OFFで線描画モードもOFFにする
+            drawLineMode = false;
+            toggleLineModeBtn.textContent = '線描画モード (OFF)';
+            canvas.style.cursor = panMode ? 'grab' : 'default'; // カーソル変更
         });
 
         clearLinesBtn.addEventListener('click', () => {
@@ -300,19 +314,20 @@
             players = [];
             lines = [];
             currentBall = null;
+            
             drawLineMode = false;
             toggleLineModeBtn.textContent = '線描画モード (OFF)';
+            
+            panMode = false; 
+            togglePanModeBtn.textContent = 'パンモード (OFF)';
             canvas.style.cursor = 'default';
+
             currentLineColor = '#000000';
             currentLineWidth = 3;
             lineWidthControl.value = 3;
             lineColorControl.value = '#000000';
             
-            // ズームとパンの状態をリセット
-            currentZoomLevel = 1.0;
-            offsetX = 0;
-            offsetY = 0;
-            applyTransform(); // 変換を適用
+            resetZoomAndPan(); 
             
             history = [];
             redrawAll();
@@ -326,15 +341,19 @@
             currentLineColor = e.target.value;
         });
 
-        zoomInBtn.addEventListener('click', () => zoom(ZOOM_STEP));
-        zoomOutBtn.addEventListener('click', () => zoom(-ZOOM_STEP));
-        resetZoomBtn.addEventListener('click', resetZoomAndPan); // 新しいボタンのイベントリスナー
+        resetZoomBtn.addEventListener('click', resetZoomAndPan);
 
-        // マウスホイールでのズーム
-        canvasContainer.addEventListener('wheel', (e) => {
-            e.preventDefault(); // ページのスクロールを防ぐ
-            const zoomAmount = e.deltaY * -0.001; // ホイールの動きをズーム量に変換
-            zoom(zoomAmount, e.clientX, e.clientY); // マウスカーソル位置をズーム中心に
+        // マウスホイールでのズーム (パンモードON時のみ有効)
+        canvas.addEventListener('wheel', (e) => { // canvasContainerではなくcanvasに直接イベントを付ける
+            if (!panMode) return; 
+
+            e.preventDefault(); 
+            const zoomAmount = e.deltaY * -0.001; 
+            const rect = canvas.getBoundingClientRect();
+            
+            const zoomCenterX = (e.clientX - rect.left);
+            const zoomCenterY = (e.clientY - rect.top);
+            zoom(zoomAmount, zoomCenterX, zoomCenterY);
         }, { passive: false });
 
 
@@ -343,25 +362,16 @@
             const oldZoomLevel = currentZoomLevel;
             currentZoomLevel = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, currentZoomLevel + amount));
 
-            if (currentZoomLevel === oldZoomLevel) return; // ズームレベルが変わらなければ処理しない
+            if (currentZoomLevel === oldZoomLevel) return;
 
-            // ズーム中心を基準としたパンの調整
-            // (x - offsetX) * newZoom = (x_old - offsetX_old) * oldZoom
-            // x_old: 元の座標系でのマウス位置
-            // x: 現在の座標系でのマウス位置
-            // 新しいオフセット = (old_x - old_offset_x) * old_zoom / new_zoom + old_offset_x - mouse_delta
-            // これだと少し複雑なので、シンプルにズーム中心が画面中央の場合は以下の式で調整
-            
-            // ズーム中心のキャンバス座標 (スケール/パン前)
-            const canvasZoomCenterX = (zoomCenterX - offsetX) / oldZoomLevel;
-            const canvasZoomCenterY = (zoomCenterY - offsetY) / oldZoomLevel;
+            const transformedZoomCenterX = (zoomCenterX - offsetX) / oldZoomLevel;
+            const transformedZoomCenterY = (zoomCenterY - offsetY) / oldZoomLevel;
 
-            // 新しいオフセットを計算
-            offsetX = zoomCenterX - canvasZoomCenterX * currentZoomLevel;
-            offsetY = zoomCenterY - canvasZoomCenterY * currentZoomLevel;
+            offsetX = zoomCenterX - transformedZoomCenterX * currentZoomLevel;
+            offsetY = zoomCenterY - transformedZoomCenterY * currentZoomLevel;
 
             applyTransform();
-            console.log("Current Zoom Level:", currentZoomLevel, "OffsetX:", offsetX, "OffsetY:", offsetY);
+            console.log("Current Zoom Level:", currentZoomLevel.toFixed(2), "OffsetX:", offsetX.toFixed(2), "OffsetY:", offsetY.toFixed(2));
         }
 
         function resetZoomAndPan() {
@@ -371,39 +381,70 @@
             applyTransform();
         }
 
+        // パンのオフセットをコート内に制限する関数
+        function clampPanOffset() {
+            // 現在のキャンバスサイズ（表示領域）を考慮
+            const currentDisplayWidth = canvas.width;
+            const currentDisplayHeight = canvas.height;
+
+            // ズームされたコンテンツの幅と高さ
+            const scaledContentWidth = currentDisplayWidth * currentZoomLevel;
+            const scaledContentHeight = currentDisplayHeight * currentZoomLevel;
+
+            // ズームされたコンテンツがキャンバス内に収まるようにオフセットを制限
+            let minOffsetX = currentDisplayWidth - scaledContentWidth;
+            let maxOffsetX = 0;
+            let minOffsetY = currentDisplayHeight - scaledContentHeight;
+            let maxOffsetY = 0;
+            
+            // ズームレベルが1.0未満（縮小表示）の場合、中央に表示する
+            if (currentZoomLevel < 1.0) {
+                // 中央揃えにするため、minとmaxを同じ値に設定
+                minOffsetX = (currentDisplayWidth - scaledContentWidth) / 2;
+                maxOffsetX = minOffsetX;
+                minOffsetY = (currentDisplayHeight - scaledContentHeight) / 2;
+                maxOffsetY = minOffsetY;
+            }
+
+            offsetX = Math.max(minOffsetX, Math.min(maxOffsetX, offsetX));
+            offsetY = Math.max(minOffsetY, Math.min(maxOffsetY, offsetY));
+        }
+
         function applyTransform() {
-            // CSS transformではなく、Canvas contextのtransformを直接操作
-            redrawAll(); // 変換を適用するために再描画を呼び出す
+            clampPanOffset(); 
+            redrawAll();
         }
 
         // --- マウス/タッチイベント処理 ---
-        function getTransformedCoords(clientX, clientY) {
+        // 画面のクライアント座標を、Canvasコンテキストのズームとパンを逆算した論理座標（コート座標系に変換する前のキャンバス内部座標）に変換
+        function getTransformedCanvasCoords(clientX, clientY) {
             const rect = canvas.getBoundingClientRect();
-            // 現在のキャンバスの表示サイズを考慮して入力座標を計算
-            // CSS Transformでズームされていた前回とは異なり、
-            // 今はctx.scale/translateが適用されているので、逆変換が必要
             let x = clientX - rect.left;
             let y = clientY - rect.top;
 
             // パンとズームの逆変換
             x = (x - offsetX) / currentZoomLevel;
             y = (y - offsetY) / currentZoomLevel;
+            
+            return { x: x, y: y }; // 論理キャンバス座標を返す
+        }
 
-            // 元のコート座標系に変換するためのスケール
+        // 論理キャンバス座標を、元のコート座標系に変換
+        function getOriginalCourtCoords(canvasX, canvasY) {
             const scaleX_to_original = ORIGINAL_COURT_LENGTH_PX / canvas.width;
             const scaleY_to_original = ORIGINAL_COURT_WIDTH_PX / canvas.height;
 
-            const transformedX = x * scaleX_to_original; // 元のコート座標系でのX座標
-            const transformedY = y * scaleY_to_original; // 元のコート座標系でのY座標
+            const originalX = canvasX * scaleX_to_original;
+            const originalY = canvasY * scaleY_to_original;
 
-            return { x: transformedX, y: transformedY, inputX: x, inputY: y }; // inputX, inputYは当たり判定用
+            return { x: originalX, y: originalY };
         }
 
         function handleInteractionStart(e) {
-            e.preventDefault(); // デフォルトのブラウザ操作（スクロール、ピンチズームなど）を抑制
+            e.preventDefault();
 
-            // ピンチジェスチャーの開始判定
-            if (e.touches && e.touches.length === 2) {
+            // ピンチジェスチャーの開始判定 (2本指タッチ) - パンモードON時のみ
+            if (panMode && e.touches && e.touches.length === 2) {
                 isPinching = true;
                 lastTouchDistance = Math.sqrt(
                     Math.pow(e.touches[0].clientX - e.touches[1].clientX, 2) +
@@ -417,9 +458,9 @@
                 currentPlayer = null;
                 isDraggingPlayerOrBall = false;
                 isPanning = false;
-                drawLineMode = false; // ピンチ中は線描画モードをOFFにするか検討
+                drawLineMode = false;
                 toggleLineModeBtn.textContent = '線描画モード (OFF)';
-                canvas.style.cursor = 'default';
+                canvas.style.cursor = 'default'; 
                 return;
             }
 
@@ -427,29 +468,39 @@
             const clientX = e.clientX || e.touches[0].clientX;
             const clientY = e.clientY || e.touches[0].clientY;
 
-            const { x: scaledInputX, y: scaledInputY, inputX, inputY } = getTransformedCoords(clientX, clientY);
+            // 論理キャンバス座標を取得
+            const { x: canvasX, y: canvasY } = getTransformedCanvasCoords(clientX, clientY);
+            // 元のコート座標系に変換
+            const { x: originalCourtX, y: originalCourtY } = getOriginalCourtCoords(canvasX, canvasY);
             
             // 当たり判定に必要なスケール
             const scaleX_for_rendering = canvas.width / ORIGINAL_COURT_LENGTH_PX;
             const scaleY_for_rendering = canvas.height / ORIGINAL_COURT_WIDTH_PX;
             const radiusScaleFactor = Math.min(scaleX_for_rendering, scaleY_for_rendering);
 
-            if (drawLineMode) {
-                lineStart = { x: scaledInputX, y: scaledInputY };
-                currentDrawingLine = { startX: scaledInputX, startY: scaledInputY, endX: scaledInputX, endY: scaledInputY, color: currentLineColor, width: currentLineWidth };
-                isDraggingPlayerOrBall = false; // 線描画中は他のドラッグはなし
-            } else {
+            if (drawLineMode) { 
+                lineStart = { x: originalCourtX, y: originalCourtY };
+                currentDrawingLine = { startX: originalCourtX, startY: originalCourtY, endX: originalCourtX, endY: originalCourtY, color: currentLineColor, width: currentLineWidth };
+                isDraggingPlayerOrBall = false;
+                isPanning = false;
+            } else if (panMode) { 
+                isPanning = true;
+                lastPanX = clientX;
+                lastPanY = clientY;
+                canvas.style.cursor = 'grabbing'; 
+            } else { // 選手/ボールの操作、線の削除 (パンモードも線描画モードもOFFの場合)
                 // まずボールのドラッグ判定
                 if (currentBall) {
                     const ballRenderX = currentBall.x * scaleX_for_rendering;
                     const ballRenderY = currentBall.y * scaleY_for_rendering;
                     const ballRenderRadius = currentBall.radius * radiusScaleFactor;
                     
-                    const distToBall = Math.sqrt(Math.pow(inputX - ballRenderX, 2) + Math.pow(inputY - ballRenderY, 2));
+                    const distToBall = Math.sqrt(Math.pow(canvasX - ballRenderX, 2) + Math.pow(canvasY - ballRenderY, 2));
                     if (distToBall < ballRenderRadius + HIT_AREA_PADDING) {
                         isDraggingPlayerOrBall = true;
                         draggingBall = true;
                         currentPlayer = null;
+                        isPanning = false;
                         return;
                     }
                 }
@@ -461,11 +512,12 @@
                     const playerRenderY = p.y * scaleY_for_rendering;
                     const playerRenderRadius = p.radius * radiusScaleFactor;
 
-                    const dist = Math.sqrt(Math.pow(inputX - playerRenderX, 2) + Math.pow(inputY - playerRenderY, 2));
+                    const dist = Math.sqrt(Math.pow(canvasX - playerRenderX, 2) + Math.pow(canvasY - playerRenderY, 2));
                     if (dist < playerRenderRadius + HIT_AREA_PADDING) {
                         isDraggingPlayerOrBall = true;
                         currentPlayer = p;
                         draggingBall = false;
+                        isPanning = false;
                         return;
                     }
                 }
@@ -484,35 +536,31 @@
                     const lenSq = dx * dx + dy * dy;
                     let t = 0;
                     if (lenSq !== 0) {
-                        t = ((inputX - lineRenderStartX) * dx + (inputY - lineRenderStartY) * dy) / lenSq;
+                        t = ((canvasX - lineRenderStartX) * dx + (canvasY - lineRenderStartY) * dy) / lenSq;
                         t = Math.max(0, Math.min(1, t));
                     }
                     
                     const closestX = lineRenderStartX + t * dx;
                     const closestY = lineRenderStartY + t * dy;
 
-                    const distToLine = Math.sqrt(Math.pow(inputX - closestX, 2) + Math.pow(inputY - closestY, 2));
+                    const distToLine = Math.sqrt(Math.pow(canvasX - closestX, 2) + Math.pow(canvasY - closestY, 2));
                     
                     if (distToLine < (lineRenderWidth / 2) + HIT_AREA_PADDING) {
                         lines.splice(i, 1);
                         redrawAll();
                         saveHistory();
+                        isPanning = false;
                         return;
                     }
                 }
-
-                // 何も選択されなかったらパンを開始
-                isPanning = true;
-                lastPanX = clientX;
-                lastPanY = clientY;
             }
         }
 
         function handleInteractionMove(e) {
             e.preventDefault();
 
-            // ピンチジェスチャー中
-            if (isPinching && e.touches && e.touches.length === 2) {
+            // ピンチジェスチャー中 (パンモードON時のみ)
+            if (panMode && isPinching && e.touches && e.touches.length === 2) {
                 const currentTouchDistance = Math.sqrt(
                     Math.pow(e.touches[0].clientX - e.touches[1].clientX, 2) +
                     Math.pow(e.touches[0].clientY - e.touches[1].clientY, 2)
@@ -522,15 +570,12 @@
                     y: (e.touches[0].clientY + e.touches[1].clientY) / 2
                 };
 
-                // ズーム
                 if (lastTouchDistance !== null) {
                     const scaleFactor = currentTouchDistance / lastTouchDistance;
                     const newZoomLevel = currentZoomLevel * scaleFactor;
                     
-                    // ズーム範囲を制限
                     const clampedZoomLevel = Math.min(MAX_ZOOM_LEVEL, Math.max(MIN_ZOOM_LEVEL, newZoomLevel));
 
-                    // ズーム中心を考慮してパンを調整
                     offsetX += currentTouchCenter.x - lastTouchCenter.x - (currentTouchCenter.x - offsetX) * (clampedZoomLevel / currentZoomLevel - 1);
                     offsetY += currentTouchCenter.y - lastTouchCenter.y - (currentTouchCenter.y - offsetY) * (clampedZoomLevel / currentZoomLevel - 1);
 
@@ -543,33 +588,35 @@
                 return;
             }
 
-            // 選手/ボールのドラッグ、線描画、パン
+            // シングルタッチ/マウスでの操作
             const clientX = e.clientX || e.touches[0].clientX;
             const clientY = e.clientY || e.touches[0].clientY;
 
-            const { x: scaledInputX, y: scaledInputY } = getTransformedCoords(clientX, clientY);
+            // 論理キャンバス座標を取得し、それを元のコート座標系に変換
+            const { x: canvasX, y: canvasY } = getTransformedCanvasCoords(clientX, clientY);
+            const { x: originalCourtX, y: originalCourtY } = getOriginalCourtCoords(canvasX, canvasY);
 
             if (drawLineMode && lineStart) {
-                currentDrawingLine.endX = scaledInputX;
-                currentDrawingLine.endY = scaledInputY;
+                currentDrawingLine.endX = originalCourtX;
+                currentDrawingLine.endY = originalCourtY;
                 redrawAll();
             } else if (isDraggingPlayerOrBall) { // 選手かボールをドラッグ中
                 if (draggingBall && currentBall) {
-                    currentBall.x = scaledInputX;
-                    currentBall.y = scaledInputY;
+                    currentBall.x = originalCourtX;
+                    currentBall.y = originalCourtY;
                 } else if (currentPlayer) {
-                    currentPlayer.x = scaledInputX;
-                    currentPlayer.y = scaledInputY;
+                    currentPlayer.x = originalCourtX;
+                    currentPlayer.y = originalCourtY;
                 }
                 redrawAll();
-            } else if (isPanning) { // パン中
+            } else if (isPanning) { // パンモードONでパン中
                 const dx = clientX - lastPanX;
                 const dy = clientY - lastPanY;
                 offsetX += dx;
                 offsetY += dy;
                 lastPanX = clientX;
                 lastPanY = clientY;
-                applyTransform();
+                applyTransform(); // パンの制限を含めて再描画
             }
         }
 
@@ -580,8 +627,7 @@
             if (isPinching) {
                 isPinching = false;
                 lastTouchDistance = null;
-                // ピンチ終了時にも履歴を保存するならここに追加
-                // saveHistory(); 
+                applyTransform(); 
                 return;
             }
 
@@ -598,19 +644,22 @@
             draggingBall = false;
             isDraggingPlayerOrBall = false;
             isPanning = false;
-            redrawAll();
+            if (panMode) { 
+                canvas.style.cursor = 'grab';
+            }
+            redrawAll(); 
         }
 
         // イベントリスナーの追加
         canvas.addEventListener('mousedown', handleInteractionStart);
         canvas.addEventListener('mousemove', handleInteractionMove);
         canvas.addEventListener('mouseup', handleInteractionEnd);
-        canvas.addEventListener('mouseleave', handleInteractionEnd); // キャンバス外に出た場合も終了
+        canvas.addEventListener('mouseleave', handleInteractionEnd); 
 
         canvas.addEventListener('touchstart', handleInteractionStart, { passive: false });
         canvas.addEventListener('touchmove', handleInteractionMove, { passive: false });
         canvas.addEventListener('touchend', handleInteractionEnd);
-        canvas.addEventListener('touchcancel', handleInteractionEnd); // 電話などで中断された場合
+        canvas.addEventListener('touchcancel', handleInteractionEnd); 
 
 
         // --- プレイヤー/ボール追加関数 (x, y は元のコート座標系) ---
@@ -631,15 +680,13 @@
             // Canvasコンテキストを保存
             ctx.save();
             
-            // パンを適用
+            // パンとズームを適用
             ctx.translate(offsetX, offsetY);
-            // ズームを適用
             ctx.scale(currentZoomLevel, currentZoomLevel);
 
-            // 描画用のスケール（元の座標系から現在のキャンバスサイズへの変換）
-            // このスケールはズーム・パンが適用される前の論理的なキャンバスサイズに基づく
-            const scaleX = canvas.width / ORIGINAL_COURT_LENGTH_PX; // 横方向のスケール (長さ方向)
-            const scaleY = canvas.height / ORIGINAL_COURT_WIDTH_PX;    // 縦方向のスケール (幅方向)
+            // 描画用のスケール（元のコート座標系から論理的なキャンバスサイズへの変換）
+            const scaleX = canvas.width / ORIGINAL_COURT_LENGTH_PX; 
+            const scaleY = canvas.height / ORIGINAL_COURT_WIDTH_PX;    
 
             // --- ピックルボールコートの描画 ---
             drawSimpleRect(0, 0, ORIGINAL_COURT_LENGTH_PX, ORIGINAL_COURT_WIDTH_PX, 'white', 3, scaleX, scaleY);
@@ -668,7 +715,7 @@
                 ctx.fillStyle = p.color;
                 ctx.fill();
                 ctx.strokeStyle = 'black';
-                ctx.lineWidth = 1 / currentZoomLevel; // ズームレベルに応じて線の太さを調整 (相対的な太さを維持)
+                ctx.lineWidth = 1 / currentZoomLevel; 
                 ctx.stroke();
             });
 
@@ -679,7 +726,7 @@
                 ctx.fillStyle = currentBall.color;
                 ctx.fill();
                 ctx.strokeStyle = 'black';
-                ctx.lineWidth = 1 / currentZoomLevel; // 線の太さ調整
+                ctx.lineWidth = 1 / currentZoomLevel; 
                 ctx.stroke();
             }
 
@@ -700,13 +747,13 @@
         // --- 図形描画ヘルパー関数 (コートライン用、矢印なし) ---
         function drawSimpleRect(x, y, width, height, color, lineWidth, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = lineWidth / currentZoomLevel; // ズームレベルに応じて線の太さを調整
+            ctx.lineWidth = lineWidth / currentZoomLevel; 
             ctx.strokeRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
         }
 
         function drawSimpleLine(x1, y1, x2, y2, color, width, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = width / currentZoomLevel; // ズームレベルに応じて線の太さを調整
+            ctx.lineWidth = width / currentZoomLevel; 
             ctx.beginPath();
             ctx.moveTo(x1 * scaleX, y1 * scaleY);
             ctx.lineTo(x2 * scaleX, y2 * scaleY); 
@@ -716,7 +763,7 @@
         // --- 矢印付きの線を描画するヘルパー関数 (ユーザー描画線用) ---
         function drawArrowLine(x1, y1, x2, y2, color, width, scaleX, scaleY) {
             ctx.strokeStyle = color;
-            ctx.lineWidth = width / currentZoomLevel; // ズームレベルに応じて線の太さを調整
+            ctx.lineWidth = width / currentZoomLevel; 
             ctx.beginPath();
             
             const sx1 = x1 * scaleX;
@@ -756,7 +803,7 @@
                 players: JSON.parse(JSON.stringify(players)),
                 lines: JSON.parse(JSON.stringify(lines)),
                 currentBall: currentBall ? JSON.parse(JSON.stringify(currentBall)) : null,
-                zoomLevel: currentZoomLevel, // ズームレベルも履歴に保存
+                zoomLevel: currentZoomLevel, 
                 offsetX: offsetX,
                 offsetY: offsetY
             });
@@ -772,7 +819,8 @@
                 currentZoomLevel = prevState.zoomLevel !== undefined ? prevState.zoomLevel : 1.0;
                 offsetX = prevState.offsetX !== undefined ? prevState.offsetX : 0;
                 offsetY = prevState.offsetY !== undefined ? prevState.offsetY : 0;
-                applyTransform(); // 変換を適用
+                
+                applyTransform(); 
                 redrawAll();
                 updateUndoButton();
             }
